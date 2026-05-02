@@ -227,7 +227,24 @@ def _import_python(node, source: bytes, file_nid: str, stem: str, edges: list, s
             })
 
 
-def _import_js(node, source: bytes, file_nid: str, stem: str, edges: list, str_path: str) -> None:
+def _import_js(node, source: bytes, file_nid: str, stem: str, edges: list, str_path: str) -> "bool | None":
+    # Treat ES module re-exports (`export * from`, `export { x } from`,
+    # `export * as ns from`) the same as imports — they create the same
+    # module-level dependency on the target file, just with a different
+    # surface relation/context so consumers can distinguish if they care.
+    is_reexport = node.type == "export_statement"
+    # An `export_statement` without a module specifier (e.g. `export const x = 1`,
+    # `export function foo() {}`, `export default …`) is NOT a re-export.
+    # Return False to tell walk() to keep descending so the inline declaration
+    # produces normal symbol nodes; otherwise this would silently drop every
+    # exported function/class/const from the graph.
+    if is_reexport and not any(c.type == "string" for c in node.children):
+        return False
+    relation = "re_exports_from" if is_reexport else "imports_from"
+    context = "re_export" if is_reexport else "import"
+    sym_relation = "re_exports" if is_reexport else "imports"
+    sym_context = "re_export" if is_reexport else "import"
+
     resolved_path: "Path | None" = None
     for child in node.children:
         if child.type == "string":
@@ -273,8 +290,8 @@ def _import_js(node, source: bytes, file_nid: str, stem: str, edges: list, str_p
             edges.append({
                 "source": file_nid,
                 "target": tgt_nid,
-                "relation": "imports_from",
-                "context": "import",
+                "relation": relation,
+                "context": context,
                 "confidence": "EXTRACTED",
                 "source_file": str_path,
                 "source_location": f"L{node.start_point[0] + 1}",
@@ -282,32 +299,41 @@ def _import_js(node, source: bytes, file_nid: str, stem: str, edges: list, str_p
             })
             break
 
-    # Emit symbol-level edges for named imports from local/aliased files.
-    # e.g. `import { Foo, type Bar } from './bar'` → file → Foo, file → Bar (EXTRACTED)
-    # Uses the same _make_id(target_stem, name) key that _extract_generic emits when
-    # defining the symbol, so these edges wire importers directly to existing symbol nodes.
+    # Emit symbol-level edges for named imports / re-exports from local/aliased
+    # files. Examples:
+    #   import { Foo, type Bar } from './bar'        → file → Foo, file → Bar (imports)
+    #   export { foo, bar as baz } from './a'        → file → foo, file → bar (re_exports)
+    # The `name` field on import_specifier / export_specifier is the source
+    # symbol name (e.g. `bar` in `bar as baz`), which matches what the helper's
+    # `_extract_generic` pass keyed nodes under.
     if resolved_path is not None:
         target_stem = _file_stem(resolved_path)
         line = node.start_point[0] + 1
         for child in node.children:
+            specs: list = []
             if child.type == "import_clause":
                 for sub in child.children:
                     if sub.type == "named_imports":
-                        for spec in sub.children:
-                            if spec.type == "import_specifier":
-                                name_node = spec.child_by_field_name("name")
-                                if name_node:
-                                    sym = _read_text(name_node, source)
-                                    edges.append({
-                                        "source": file_nid,
-                                        "target": _make_id(target_stem, sym),
-                                        "relation": "imports",
-                                        "context": "import",
-                                        "confidence": "EXTRACTED",
-                                        "source_file": str_path,
-                                        "source_location": f"L{line}",
-                                        "weight": 1.0,
-                                    })
+                        specs.extend(sub.children)
+            elif child.type == "export_clause":
+                specs.extend(child.children)
+            for spec in specs:
+                if spec.type not in ("import_specifier", "export_specifier"):
+                    continue
+                name_node = spec.child_by_field_name("name")
+                if not name_node:
+                    continue
+                sym = _read_text(name_node, source)
+                edges.append({
+                    "source": file_nid,
+                    "target": _make_id(target_stem, sym),
+                    "relation": sym_relation,
+                    "context": sym_context,
+                    "confidence": "EXTRACTED",
+                    "source_file": str_path,
+                    "source_location": f"L{line}",
+                    "weight": 1.0,
+                })
 
 
 def _dynamic_import_js(node, source: bytes, caller_nid: str, str_path: str, edges: list,
@@ -663,7 +689,10 @@ _JS_CONFIG = LanguageConfig(
     ts_module="tree_sitter_javascript",
     class_types=frozenset({"class_declaration"}),
     function_types=frozenset({"function_declaration", "method_definition"}),
-    import_types=frozenset({"import_statement"}),
+    # `export_statement` covers re-exports (`export * from`, `export { x } from`,
+    # `export * as ns from`). Plain non-re-export exports have no module
+    # specifier and the handler emits no edge for them.
+    import_types=frozenset({"import_statement", "export_statement"}),
     call_types=frozenset({"call_expression"}),
     call_function_field="function",
     call_accessor_node_types=frozenset({"member_expression"}),
@@ -677,7 +706,7 @@ _TS_CONFIG = LanguageConfig(
     ts_language_fn="language_typescript",
     class_types=frozenset({"class_declaration"}),
     function_types=frozenset({"function_declaration", "method_definition"}),
-    import_types=frozenset({"import_statement"}),
+    import_types=frozenset({"import_statement", "export_statement"}),
     call_types=frozenset({"call_expression"}),
     call_function_field="function",
     call_accessor_node_types=frozenset({"member_expression"}),
@@ -985,8 +1014,19 @@ def _extract_generic(path: Path, config: LanguageConfig, source_override: bytes 
         # Import types
         if t in config.import_types:
             if config.import_handler:
-                config.import_handler(node, source, file_nid, stem, edges, str_path)
-            return
+                # Handlers may return False to opt out of terminating the walk,
+                # which is needed for nodes like `export_statement` that can
+                # either be re-exports (terminal — handled by the handler) or
+                # carry inline declarations (`export const x = 1`,
+                # `export function f() {}`) whose children must still be
+                # recursed so the declared symbols become nodes.
+                consumed = config.import_handler(node, source, file_nid, stem, edges, str_path)
+                if consumed is False:
+                    pass  # fall through to default recurse below
+                else:
+                    return
+            else:
+                return
 
         # Class types
         if t in config.class_types:
@@ -1586,7 +1626,9 @@ def _extract_generic(path: Path, config: LanguageConfig, source_override: bytes 
     clean_edges = []
     for edge in edges:
         src, tgt = edge["source"], edge["target"]
-        if src in valid_ids and (tgt in valid_ids or edge["relation"] in ("imports", "imports_from")):
+        if src in valid_ids and (tgt in valid_ids or edge["relation"] in (
+            "imports", "imports_from", "re_exports", "re_exports_from",
+        )):
             clean_edges.append(edge)
 
     return {"nodes": nodes, "edges": clean_edges, "raw_calls": raw_calls}
@@ -2571,7 +2613,9 @@ def extract_go(path: Path) -> dict:
     clean_edges = []
     for edge in edges:
         src, tgt = edge["source"], edge["target"]
-        if src in valid_ids and (tgt in valid_ids or edge["relation"] in ("imports", "imports_from")):
+        if src in valid_ids and (tgt in valid_ids or edge["relation"] in (
+            "imports", "imports_from", "re_exports", "re_exports_from",
+        )):
             clean_edges.append(edge)
 
     return {"nodes": nodes, "edges": clean_edges, "raw_calls": raw_calls}
@@ -2756,7 +2800,9 @@ def extract_rust(path: Path) -> dict:
     clean_edges = []
     for edge in edges:
         src, tgt = edge["source"], edge["target"]
-        if src in valid_ids and (tgt in valid_ids or edge["relation"] in ("imports", "imports_from")):
+        if src in valid_ids and (tgt in valid_ids or edge["relation"] in (
+            "imports", "imports_from", "re_exports", "re_exports_from",
+        )):
             clean_edges.append(edge)
 
     return {"nodes": nodes, "edges": clean_edges, "raw_calls": raw_calls}
