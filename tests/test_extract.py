@@ -1,5 +1,14 @@
+import json
 from pathlib import Path
-from graphify.extract import extract_python, extract, collect_files, _make_id
+from graphify.extract import (
+    extract_python,
+    extract,
+    extract_js,
+    collect_files,
+    _make_id,
+    _resolve_js_import_to_file,
+    _TSCONFIG_ALIAS_CACHE,
+)
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -57,13 +66,9 @@ def test_extract_merges_multiple_files():
 
 
 def test_collect_files_from_dir():
+    from graphify.detect import CODE_EXTENSIONS
     files = collect_files(FIXTURES)
-    supported = {".py", ".js", ".ts", ".tsx", ".go", ".rs",
-                 ".java", ".c", ".cpp", ".cc", ".cxx", ".rb",
-                 ".cs", ".kt", ".kts", ".scala", ".php", ".h", ".hpp",
-                 ".swift", ".lua", ".toc", ".zig", ".ps1", ".ex", ".exs",
-                 ".m", ".mm"}
-    assert all(f.suffix in supported for f in files)
+    assert all(f.suffix in CODE_EXTENSIONS for f in files)
     assert len(files) > 0
 
 
@@ -197,3 +202,139 @@ def test_cross_file_calls_skip_ambiguous_duplicate_labels(tmp_path):
         nodes[e["source"]]["label"] == "run()" and nodes[e["target"]]["label"] == "log()"
         for e in calls
     )
+
+
+# ── Svelte alias / extension resolution (fix for $lib import undercount) ──────
+
+def _build_svelte_corpus(tmp_path: Path) -> tuple[Path, Path]:
+    """Set up a minimal admin-style corpus: tsconfig with `$lib/*` alias, a TS
+    helper at the alias target, and a Svelte component importing from it."""
+    _TSCONFIG_ALIAS_CACHE.clear()
+    assets = tmp_path / "assets"
+    assets.mkdir()
+    (assets / "tsconfig.json").write_text(json.dumps({
+        "compilerOptions": {
+            "baseUrl": ".",
+            "paths": {
+                "$lib": ["./svelte/lib"],
+                "$lib/*": ["./svelte/lib/*"],
+            },
+        },
+    }))
+    lib = assets / "svelte" / "lib" / "utils"
+    lib.mkdir(parents=True)
+    helper = lib / "rbac.domain.ts"
+    helper.write_text(
+        "export function getFeatureContext() { return null; }\n"
+        "export const F_FOO = 'foo';\n"
+    )
+    page_dir = assets / "svelte" / "Ops"
+    page_dir.mkdir(parents=True)
+    page = page_dir / "Page.svelte"
+    page.write_text(
+        '<script lang="ts">\n'
+        "  import { getFeatureContext, F_FOO } from '$lib/utils/rbac.domain';\n"
+        "  const ctx = getFeatureContext();\n"
+        "</script>\n"
+        "<div>{ctx} {F_FOO}</div>\n"
+    )
+    return page, helper
+
+
+def test_resolve_js_import_appends_ts_extension(tmp_path):
+    target = tmp_path / "rbac.domain"
+    (tmp_path / "rbac.domain.ts").write_text("export const X = 1;")
+    resolved = _resolve_js_import_to_file(target)
+    assert resolved.suffix == ".ts"
+    assert resolved.is_file()
+
+
+def test_resolve_js_import_prefers_ts_over_js_when_both_exist(tmp_path):
+    target = tmp_path / "helper"
+    (tmp_path / "helper.js").write_text("module.exports = {};")
+    (tmp_path / "helper.ts").write_text("export const X = 1;")
+    resolved = _resolve_js_import_to_file(target)
+    # TS wins because it's first in the resolution order (TS-first corpora
+    # are the common case for Svelte/Vite admin frontends).
+    assert resolved.suffix == ".ts"
+
+
+def test_resolve_js_import_falls_back_to_index_file(tmp_path):
+    pkg = tmp_path / "icons"
+    pkg.mkdir()
+    (pkg / "index.ts").write_text("export const liveGif = 'x';")
+    resolved = _resolve_js_import_to_file(pkg)
+    assert resolved.name == "index.ts"
+
+
+def test_resolve_js_import_returns_unchanged_when_missing(tmp_path):
+    target = tmp_path / "nope"
+    resolved = _resolve_js_import_to_file(target)
+    assert resolved == target
+
+
+def test_extract_js_parses_svelte_imports(tmp_path):
+    """Svelte SFC must go through the lenient TS grammar so script-block
+    imports are captured. JS grammar fails on the `<script>` HTML wrapper."""
+    page, _ = _build_svelte_corpus(tmp_path)
+    result = extract_js(page)
+    imports = [e for e in result["edges"] if e["relation"] == "imports_from"]
+    assert imports, "Svelte component imports must be extracted"
+
+
+def _file_node_id(result: dict, path: Path) -> str:
+    """`extract()` remaps file ids and source_file from absolute → project-
+    relative. Match by label (always the basename) and source_file ending."""
+    name = path.name
+    for n in result["nodes"]:
+        if (n.get("label") == name
+                and n.get("file_type") == "code"
+                and n.get("source_location") == "L1"):
+            sf = n.get("source_file") or ""
+            if sf == str(path) or sf.endswith(name):
+                return n["id"]
+    raise AssertionError(f"no file node for {path}; nodes={result['nodes']}")
+
+
+def test_svelte_alias_import_links_to_real_file_node(tmp_path):
+    """`$lib/utils/rbac.domain` (no extension) must resolve to the .ts file
+    node id so the import edge isn't dangling — the regression we hit on
+    packages/admin where 50+ batch components looked unrelated to rbac.domain."""
+    page, helper = _build_svelte_corpus(tmp_path)
+    result = extract([page, helper], cache_root=tmp_path)
+    page_id = _file_node_id(result, page)
+    helper_id = _file_node_id(result, helper)
+    pairs = {(e["source"], e["target"]) for e in result["edges"]
+             if e["relation"] == "imports_from"}
+    assert (page_id, helper_id) in pairs, (
+        f"Expected {page_id} → {helper_id} imports_from edge; got {pairs}"
+    )
+
+
+def test_svelte_alias_import_emits_symbol_edges(tmp_path):
+    """Named imports through an alias should still emit per-symbol `imports`
+    edges that match the symbol nodes the helper file defines."""
+    page, helper = _build_svelte_corpus(tmp_path)
+    result = extract([page, helper], cache_root=tmp_path)
+    page_id = _file_node_id(result, page)
+    sym_targets = {
+        e["target"] for e in result["edges"]
+        if e["source"] == page_id and e["relation"] == "imports"
+    }
+    node_labels = {n["id"]: n.get("label", "") for n in result["nodes"]}
+    imported_labels = {node_labels.get(t, "") for t in sym_targets}
+    assert any("getFeatureContext" in l for l in imported_labels), imported_labels
+
+
+def test_relative_import_without_extension_resolves(tmp_path):
+    """`./helper` (no extension) must resolve to helper.ts, mirroring how
+    Vite/TS bundler resolution works at runtime."""
+    _TSCONFIG_ALIAS_CACHE.clear()
+    caller = tmp_path / "caller.ts"
+    caller.write_text("import { x } from './helper';\nconsole.log(x);\n")
+    helper = tmp_path / "helper.ts"
+    helper.write_text("export const x = 1;\n")
+    result = extract([caller, helper], cache_root=tmp_path)
+    pairs = {(e["source"], e["target"]) for e in result["edges"]
+             if e["relation"] == "imports_from"}
+    assert (_file_node_id(result, caller), _file_node_id(result, helper)) in pairs
