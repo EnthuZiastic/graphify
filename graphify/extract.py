@@ -29,6 +29,50 @@ def _file_stem(path: Path) -> str:
 
 _TSCONFIG_ALIAS_CACHE: dict[str, dict[str, str]] = {}
 
+# Extensions tried when an import target has no recognized suffix (e.g.
+# `$lib/utils/rbac.domain` resolved by tsconfig alias points at a stem; the real
+# file is `rbac.domain.ts`). Order = TypeScript-first, since modern Svelte/Vite
+# corpora are predominantly TS, then plain JS, then Svelte SFC.
+_JS_RESOLVE_EXTENSIONS: tuple[str, ...] = (".ts", ".tsx", ".svelte", ".js", ".jsx", ".mjs")
+_JS_RESOLVE_INDEX_NAMES: tuple[str, ...] = (
+    "index.ts", "index.tsx", "index.svelte", "index.js", "index.jsx", "index.mjs",
+)
+
+
+def _resolve_js_import_to_file(base: Path) -> Path:
+    """Resolve a JS/TS/Svelte import target path to an existing source file.
+
+    Imports written as `from '$lib/foo'` or `from './bar'` omit the extension;
+    Svelte/Vite/tsconfig handle that at build time. The AST extractor must do
+    the same so the emitted target node id matches the corresponding file
+    node id (otherwise the edge dangles invisibly).
+
+    Returns `base` unchanged when no candidate exists, preserving prior
+    behavior for imports that point outside the corpus.
+    """
+    if base.is_file():
+        return base
+    # Always try appending against the full name first. Module paths like
+    # `$lib/utils/rbac.domain` have a dotted segment that Path.suffix treats
+    # as ".domain" — `with_suffix(".ts")` would wrongly produce `rbac.ts`.
+    for ext in _JS_RESOLVE_EXTENSIONS:
+        cand = base.parent / f"{base.name}{ext}"
+        if cand.is_file():
+            return cand
+    # Then try suffix swap — covers `import './foo.js'` whose real file is .ts.
+    if base.suffix in _JS_RESOLVE_EXTENSIONS:
+        for ext in _JS_RESOLVE_EXTENSIONS:
+            cand = base.with_suffix(ext)
+            if cand.is_file():
+                return cand
+    # Finally, treat as directory with an index.* file.
+    if base.is_dir():
+        for name in _JS_RESOLVE_INDEX_NAMES:
+            cand = base / name
+            if cand.is_file():
+                return cand
+    return base
+
 
 def _load_tsconfig_aliases(start_dir: Path) -> dict[str, str]:
     """Walk up from start_dir to find tsconfig.json and return compilerOptions.paths aliases.
@@ -199,6 +243,10 @@ def _import_js(node, source: bytes, file_nid: str, stem: str, edges: list, str_p
                     resolved = resolved.with_suffix(".ts")
                 elif resolved.suffix == ".jsx":
                     resolved = resolved.with_suffix(".tsx")
+                # Imports without an extension (Svelte/Vite/TS bundler resolution):
+                # try common JS/TS/Svelte suffixes + index files so the target id
+                # matches the actual file node's id.
+                resolved = _resolve_js_import_to_file(resolved)
                 tgt_nid = _make_id(str(resolved))
                 resolved_path = resolved
             else:
@@ -211,6 +259,9 @@ def _import_js(node, source: bytes, file_nid: str, stem: str, edges: list, str_p
                         resolved_alias = Path(os.path.normpath(Path(alias_base) / rest))
                         break
                 if resolved_alias is not None:
+                    # Same extension/index resolution as the relative branch — alias
+                    # imports also routinely omit the extension (e.g. `$lib/utils/rbac.domain`).
+                    resolved_alias = _resolve_js_import_to_file(resolved_alias)
                     tgt_nid = _make_id(str(resolved_alias))
                     resolved_path = resolved_alias
                 else:
@@ -306,6 +357,7 @@ def _dynamic_import_js(node, source: bytes, caller_nid: str, str_path: str, edge
                 resolved = resolved.with_suffix(".ts")
             elif resolved.suffix == ".jsx":
                 resolved = resolved.with_suffix(".tsx")
+            resolved = _resolve_js_import_to_file(resolved)
             tgt_nid = _make_id(str(resolved))
         else:
             aliases = _load_tsconfig_aliases(Path(str_path).parent)
@@ -316,6 +368,7 @@ def _dynamic_import_js(node, source: bytes, caller_nid: str, str_path: str, edge
                     resolved_alias = Path(os.path.normpath(Path(alias_base) / rest))
                     break
             if resolved_alias is not None:
+                resolved_alias = _resolve_js_import_to_file(resolved_alias)
                 tgt_nid = _make_id(str(resolved_alias))
             else:
                 module_name = raw.split("/")[-1]
@@ -849,8 +902,13 @@ _SWIFT_CONFIG = LanguageConfig(
 
 # ── Generic extractor ─────────────────────────────────────────────────────────
 
-def _extract_generic(path: Path, config: LanguageConfig) -> dict:
-    """Generic AST extractor driven by LanguageConfig."""
+def _extract_generic(path: Path, config: LanguageConfig, source_override: bytes | None = None) -> dict:
+    """Generic AST extractor driven by LanguageConfig.
+
+    `source_override` lets callers pre-transform the source bytes before
+    parsing (used by the Svelte path to strip template markup while preserving
+    byte offsets and line numbers).
+    """
     try:
         mod = importlib.import_module(config.ts_module)
         from tree_sitter import Language, Parser
@@ -868,7 +926,7 @@ def _extract_generic(path: Path, config: LanguageConfig) -> dict:
 
     try:
         parser = Parser(language)
-        source = path.read_bytes()
+        source = source_override if source_override is not None else path.read_bytes()
         tree = parser.parse(source)
         root = tree.root_node
     except Exception as e:
@@ -1650,8 +1708,49 @@ def extract_python(path: Path) -> dict:
     return result
 
 
+_SVELTE_SCRIPT_RE = re.compile(rb"<script\b[^>]*>(.*?)</script>", re.DOTALL | re.IGNORECASE)
+
+
+def _strip_svelte_template(raw: bytes) -> bytes:
+    """Blank out everything outside `<script>` blocks while preserving newlines
+    and byte offsets, so the surviving TypeScript content sits at its original
+    line numbers when fed to tree-sitter-typescript.
+
+    This is needed because tree-sitter-typescript treats `<script lang="ts">`
+    and the surrounding template markup as a malformed expression — it bails
+    on the first import_statement long before reaching the real script body.
+    Blanking template regions lets the parser see the script content cleanly
+    while keeping line/column points accurate for emitted edges.
+    """
+    matches = list(_SVELTE_SCRIPT_RE.finditer(raw))
+    if not matches:
+        return raw
+    out = bytearray(len(raw))
+    keep_ranges: list[tuple[int, int]] = []
+    for m in matches:
+        body_start, body_end = m.span(1)
+        keep_ranges.append((body_start, body_end))
+    keep_set = {i for s, e in keep_ranges for i in range(s, e)}
+    # Two-step: copy newlines verbatim everywhere (so line numbers stay
+    # aligned), copy script-body bytes verbatim, blank the rest with spaces.
+    for i, byte in enumerate(raw):
+        if i in keep_set or byte == 0x0A:  # '\n'
+            out[i] = byte
+        else:
+            out[i] = 0x20  # ' '
+    return bytes(out)
+
+
 def extract_js(path: Path) -> dict:
-    """Extract classes, functions, arrow functions, and imports from a .js/.ts/.tsx file."""
+    """Extract classes, functions, arrow functions, and imports from a .js/.ts/.tsx/.svelte file.
+
+    `.svelte` is preprocessed (template stripped, script kept) and routed
+    through the TypeScript grammar because the JS grammar treats the
+    surrounding `<script>` markup as a hard parse error and produces zero
+    usable nodes.
+    """
+    if path.suffix == ".svelte":
+        return _extract_generic(path, _TS_CONFIG, source_override=_strip_svelte_template(path.read_bytes()))
     config = _TS_CONFIG if path.suffix in (".ts", ".tsx") else _JS_CONFIG
     return _extract_generic(path, config)
 
@@ -4002,14 +4101,11 @@ def extract(
 def collect_files(target: Path, *, follow_symlinks: bool = False, root: Path | None = None) -> list[Path]:
     if target.is_file():
         return [target]
-    _EXTENSIONS = {
-        ".py", ".js", ".ts", ".tsx", ".go", ".rs",
-        ".java", ".c", ".h", ".cpp", ".cc", ".cxx", ".hpp",
-        ".rb", ".cs", ".kt", ".kts", ".scala", ".php", ".swift",
-        ".lua", ".toc", ".zig", ".ps1",
-        ".m", ".mm",
-    }
-    from graphify.detect import _load_graphifyignore, _is_ignored
+    # Reuse the canonical extension set from detect.py so .svelte/.vue/.mjs/
+    # .jsx/.ex/.exs/.dart/.sql etc. that have AST extractors aren't silently
+    # filtered out before dispatch reaches them.
+    from graphify.detect import CODE_EXTENSIONS, _load_graphifyignore, _is_ignored
+    _EXTENSIONS = CODE_EXTENSIONS
     ignore_root = root if root is not None else target
     patterns = _load_graphifyignore(ignore_root)
 
