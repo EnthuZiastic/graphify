@@ -238,7 +238,15 @@ def _import_js(node, source: bytes, file_nid: str, stem: str, edges: list, str_p
     # Return False to tell walk() to keep descending so the inline declaration
     # produces normal symbol nodes; otherwise this would silently drop every
     # exported function/class/const from the graph.
-    if is_reexport and not any(c.type == "string" for c in node.children):
+    #
+    # Detect re-export shape via the direct `from` keyword child rather than
+    # the presence of any `string` child — `export default "literal"` and
+    # `export default 42` etc. parse with the literal as a direct child of
+    # the export_statement, so a string-presence test would falsely classify
+    # them as re-exports and emit a dangling edge to the literal text. Real
+    # re-exports always include `from "X"` at the top level of the node:
+    #   export * from "X" / export { x } from "X" / export * as ns from "X"
+    if is_reexport and not any(c.type == "from" for c in node.children):
         return False
     relation = "re_exports_from" if is_reexport else "imports_from"
     context = "re_export" if is_reexport else "import"
