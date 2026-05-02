@@ -409,6 +409,32 @@ def test_export_namespace_from_emits_file_edge(tmp_path):
             "re_exports_from") in pairs, pairs
 
 
+def test_export_default_string_literal_does_not_emit_reexport(tmp_path):
+    """`export default "some-literal"` parses with a direct `string` child of
+    the export_statement, but it is NOT a re-export — only `… from "X"` is.
+    The handler must not emit a `re_exports_from` edge whose target is the
+    literal text. Regression for code review feedback on PR #2."""
+    _TSCONFIG_ALIAS_CACHE.clear()
+    f = tmp_path / "default.ts"
+    f.write_text('export default "some-literal-value";\n')
+    result = extract([f], cache_root=tmp_path)
+    bogus = [e for e in result["edges"]
+             if e["relation"] in ("re_exports_from", "imports_from")
+             and "literal" in str(e.get("target", ""))]
+    assert not bogus, bogus
+
+
+def test_export_default_number_does_not_emit_reexport(tmp_path):
+    """`export default 42` (number literal) is also not a re-export; same
+    guard must filter it out."""
+    _TSCONFIG_ALIAS_CACHE.clear()
+    f = tmp_path / "answer.ts"
+    f.write_text("export default 42;\n")
+    result = extract([f], cache_root=tmp_path)
+    re_exports = [e for e in result["edges"] if e["relation"] == "re_exports_from"]
+    assert not re_exports, re_exports
+
+
 def test_export_from_resolves_extension_like_import(tmp_path):
     """Re-exports must use the same extensionless-resolution logic as imports
     so `export * from './rbac'` lands on `rbac.ts`."""
