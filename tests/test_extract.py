@@ -338,3 +338,88 @@ def test_relative_import_without_extension_resolves(tmp_path):
     pairs = {(e["source"], e["target"]) for e in result["edges"]
              if e["relation"] == "imports_from"}
     assert (_file_node_id(result, caller), _file_node_id(result, helper)) in pairs
+
+
+# ── ES module re-export edges (`export * from`, `export { x } from`) ──────────
+
+def test_export_star_emits_reexports_from_edge(tmp_path):
+    """`export * from './target'` must produce a re_exports_from edge so the
+    barrel/shim file shows as a dependent of the target in the graph."""
+    _TSCONFIG_ALIAS_CACHE.clear()
+    shim = tmp_path / "shim.ts"
+    shim.write_text("export * from './target';\n")
+    target = tmp_path / "target.ts"
+    target.write_text("export const x = 1;\nexport function foo() {}\n")
+    result = extract([shim, target], cache_root=tmp_path)
+    pairs = {(e["source"], e["target"], e["relation"]) for e in result["edges"]
+             if e["relation"] in ("imports_from", "re_exports_from")}
+    sid = _file_node_id(result, shim)
+    tid = _file_node_id(result, target)
+    assert (sid, tid, "re_exports_from") in pairs, pairs
+
+
+def test_export_named_from_emits_symbol_edges(tmp_path):
+    """`export { foo, bar as baz } from './target'` must emit per-symbol
+    `re_exports` edges keyed on the source-side names (foo, bar — not baz)."""
+    _TSCONFIG_ALIAS_CACHE.clear()
+    shim = tmp_path / "shim.ts"
+    shim.write_text("export { foo, bar as baz } from './target';\n")
+    target = tmp_path / "target.ts"
+    target.write_text("export function foo() {}\nexport function bar() {}\n")
+    result = extract([shim, target], cache_root=tmp_path)
+    sid = _file_node_id(result, shim)
+    sym_targets = {
+        e["target"] for e in result["edges"]
+        if e["source"] == sid and e["relation"] == "re_exports"
+    }
+    labels = {n["id"]: n.get("label", "") for n in result["nodes"]}
+    reexported = {labels.get(t, "") for t in sym_targets}
+    assert any("foo" in l for l in reexported), reexported
+    assert any("bar" in l for l in reexported), reexported
+
+
+def test_inline_export_declaration_still_emits_symbol_node(tmp_path):
+    """`export function foo() {}` and `export const x = 1` must NOT be
+    silently dropped just because export_statement is now in import_types.
+    Walk must still recurse into the inline declaration."""
+    _TSCONFIG_ALIAS_CACHE.clear()
+    f = tmp_path / "lib.ts"
+    f.write_text(
+        "export function foo() {}\n"
+        "export class Bar {}\n"
+        "export const x = 1;\n"
+    )
+    result = extract([f], cache_root=tmp_path)
+    labels = {n.get("label", "") for n in result["nodes"]}
+    assert any("foo" in l for l in labels), labels
+    assert "Bar" in labels, labels
+
+
+def test_export_namespace_from_emits_file_edge(tmp_path):
+    """`export * as ns from './target'` is a re-export shape too."""
+    _TSCONFIG_ALIAS_CACHE.clear()
+    shim = tmp_path / "shim.ts"
+    shim.write_text("export * as ns from './target';\n")
+    target = tmp_path / "target.ts"
+    target.write_text("export const x = 1;\n")
+    result = extract([shim, target], cache_root=tmp_path)
+    pairs = {(e["source"], e["target"], e["relation"]) for e in result["edges"]
+             if e["relation"] == "re_exports_from"}
+    assert (_file_node_id(result, shim), _file_node_id(result, target),
+            "re_exports_from") in pairs, pairs
+
+
+def test_export_from_resolves_extension_like_import(tmp_path):
+    """Re-exports must use the same extensionless-resolution logic as imports
+    so `export * from './rbac'` lands on `rbac.ts`."""
+    _TSCONFIG_ALIAS_CACHE.clear()
+    shim = tmp_path / "shim.ts"
+    shim.write_text("export * from './target';\n")  # no extension
+    target = tmp_path / "target.ts"
+    target.write_text("export const x = 1;\n")
+    result = extract([shim, target], cache_root=tmp_path)
+    sid = _file_node_id(result, shim)
+    tid = _file_node_id(result, target)
+    edge_targets = {(e["source"], e["target"]) for e in result["edges"]
+                    if e["relation"] == "re_exports_from"}
+    assert (sid, tid) in edge_targets, edge_targets
