@@ -16,6 +16,15 @@ _LANG_FAMILY: dict[str, str] = {
     **{e: "dotnet" for e in (".cs",)},
     **{e: "php" for e in (".php",)},
     **{e: "r" for e in (".r",)},
+    **{e: "elixir" for e in (".ex", ".exs")},
+    **{e: "dart" for e in (".dart",)},
+    **{e: "lua" for e in (".lua", ".toc")},
+    **{e: "julia" for e in (".jl",)},
+    **{e: "zig" for e in (".zig",)},
+    **{e: "powershell" for e in (".ps1",)},
+    **{e: "objc" for e in (".m", ".mm")},
+    **{e: "verilog" for e in (".v", ".sv")},
+    **{e: "sql" for e in (".sql",)},
 }
 
 
