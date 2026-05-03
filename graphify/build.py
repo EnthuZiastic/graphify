@@ -66,6 +66,15 @@ def build_from_json(extraction: dict, *, directed: bool = False) -> nx.Graph:
             )
             node["source_file"] = node.pop("source")
 
+    # Merge AST + semantic nodes that share a label but have differently-formatted IDs.
+    # AST IDs include parent-dir prefix (`{parent}_{stem}_{entity}`), LLM IDs are
+    # often shorter (`{stem}_{entity}`); both carry the same `label`. Without this
+    # step the two passes produce parallel disconnected subgraphs.
+    nodes = extraction.get("nodes", [])
+    edges = extraction.get("edges", [])
+    nodes, edges = deduplicate_by_label(nodes, edges)
+    extraction = dict(extraction, nodes=nodes, edges=edges)
+
     errors = validate_extraction(extraction)
     # Dangling edges (stdlib/external imports) are expected - only warn about real schema errors.
     real_errors = [e for e in errors if "does not match any node id" not in e]
@@ -103,7 +112,49 @@ def build_from_json(extraction: dict, *, directed: bool = False) -> nx.Graph:
     hyperedges = extraction.get("hyperedges", [])
     if hyperedges:
         G.graph["hyperedges"] = hyperedges
+    _anchor_orphans_to_source_file(G)
     return G
+
+
+def _anchor_orphans_to_source_file(G: nx.Graph) -> None:
+    """Connect zero-degree semantic-only nodes to their source-file's AST anchor.
+
+    Semantic concept nodes (e.g. "OAuth Providers Config", "Libcluster Topology")
+    legitimately have no AST counterpart but live inside a source file. Without
+    an edge they form singletons that fragment community detection. This
+    attaches each such orphan to the first AST node with a matching `source_file`
+    via a `part_of` INFERRED edge — purely structural, no LLM cost.
+    """
+    if G.number_of_nodes() == 0:
+        return
+    file_anchor: dict[str, str] = {}
+    for nid, ndata in G.nodes(data=True):
+        if ndata.get("source_location") and ndata.get("source_file"):
+            sf = ndata["source_file"]
+            if sf not in file_anchor:
+                file_anchor[sf] = nid
+    anchored = 0
+    for nid in list(G.nodes()):
+        ndata = G.nodes[nid]
+        if G.degree(nid) > 0:
+            continue
+        if ndata.get("source_location"):
+            continue  # AST orphan — leave alone
+        sf = ndata.get("source_file")
+        if not sf:
+            continue
+        anchor = file_anchor.get(sf)
+        if anchor and anchor != nid:
+            G.add_edge(
+                nid, anchor, relation="part_of", confidence="INFERRED",
+                confidence_score=0.85, weight=1.0, _src=nid, _tgt=anchor,
+            )
+            anchored += 1
+    if anchored:
+        print(
+            f"[graphify] Anchored {anchored} orphan semantic node(s) to their source files.",
+            file=sys.stderr,
+        )
 
 
 def build(extractions: list[dict], *, directed: bool = False) -> nx.Graph:
@@ -135,10 +186,29 @@ def _norm_label(label: str) -> str:
 def deduplicate_by_label(nodes: list[dict], edges: list[dict]) -> tuple[list[dict], list[dict]]:
     """Merge nodes that share a normalised label, rewriting edge references.
 
-    Prefers IDs without chunk suffixes (_c\\d+) and shorter IDs when tied.
-    Drops self-loops created by the merge. Called in build() automatically.
+    Tiebreakers, in order:
+      1. Prefer the node with `source_location` (AST origin — has precise line info
+         the semantic LLM pass cannot supply). This lets AST and LLM extractions
+         converge even when their ID schemes differ.
+      2. Prefer IDs without chunk suffixes (`_c\\d+`).
+      3. Prefer the shorter ID.
+
+    Drops self-loops created by the merge. Called from `build_from_json`.
     """
     _CHUNK_SUFFIX = re.compile(r"_c\d+$")
+
+    def _better(a: dict, b: dict) -> bool:
+        """Return True if `a` should win over `b`."""
+        a_loc = bool(a.get("source_location"))
+        b_loc = bool(b.get("source_location"))
+        if a_loc != b_loc:
+            return a_loc  # node with source_location wins
+        a_suf = bool(_CHUNK_SUFFIX.search(a["id"]))
+        b_suf = bool(_CHUNK_SUFFIX.search(b["id"]))
+        if a_suf != b_suf:
+            return not a_suf  # node without chunk suffix wins
+        return len(a["id"]) < len(b["id"])  # shorter ID wins
+
     canonical: dict[str, dict] = {}  # norm_label -> surviving node
     remap: dict[str, str] = {}       # old_id -> surviving_id
 
@@ -149,19 +219,11 @@ def deduplicate_by_label(nodes: list[dict], edges: list[dict]) -> tuple[list[dic
         existing = canonical.get(key)
         if existing is None:
             canonical[key] = node
+        elif _better(node, existing):
+            remap[existing["id"]] = node["id"]
+            canonical[key] = node
         else:
-            has_suffix = bool(_CHUNK_SUFFIX.search(node["id"]))
-            existing_has_suffix = bool(_CHUNK_SUFFIX.search(existing["id"]))
-            if has_suffix and not existing_has_suffix:
-                remap[node["id"]] = existing["id"]
-            elif existing_has_suffix and not has_suffix:
-                remap[existing["id"]] = node["id"]
-                canonical[key] = node
-            elif len(node["id"]) < len(existing["id"]):
-                remap[existing["id"]] = node["id"]
-                canonical[key] = node
-            else:
-                remap[node["id"]] = existing["id"]
+            remap[node["id"]] = existing["id"]
 
     if not remap:
         return nodes, edges

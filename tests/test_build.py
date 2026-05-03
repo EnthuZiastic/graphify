@@ -60,3 +60,61 @@ def test_build_merges_multiple_extractions():
     G = build([ext1, ext2])
     assert G.number_of_nodes() == 2
     assert G.number_of_edges() == 1
+
+
+def test_dedup_prefers_ast_node_over_llm_with_same_label():
+    """When AST and LLM emit the same entity with different IDs, the AST node wins.
+
+    AST nodes carry `source_location` (precise line info). LLM-style IDs are
+    typically shorter (no parent-dir prefix). The merge must keep the AST id and
+    redirect edges that referenced the LLM id.
+    """
+    ext = {
+        "nodes": [
+            # AST-shape node — has source_location
+            {"id": "auth_session_validate_token", "label": "ValidateToken",
+             "file_type": "code", "source_file": "src/auth/session.py",
+             "source_location": "L42"},
+            # LLM-shape node — same label, shorter id, no source_location
+            {"id": "session_validatetoken", "label": "ValidateToken",
+             "file_type": "code", "source_file": "src/auth/session.py"},
+            {"id": "caller", "label": "Caller", "file_type": "code",
+             "source_file": "src/handler.py"},
+        ],
+        # Edge points at the LLM id; after merge it should land on the AST id.
+        "edges": [
+            {"source": "caller", "target": "session_validatetoken",
+             "relation": "calls", "confidence": "EXTRACTED",
+             "source_file": "src/handler.py", "weight": 1.0},
+        ],
+        "input_tokens": 0, "output_tokens": 0,
+    }
+    G = build_from_json(ext)
+    assert G.number_of_nodes() == 2  # validatetoken merged
+    assert "auth_session_validate_token" in G.nodes
+    assert "session_validatetoken" not in G.nodes
+    # Edge survived and points at the AST node
+    assert G.has_edge("caller", "auth_session_validate_token")
+
+
+def test_orphan_semantic_node_anchored_to_source_file():
+    """Zero-degree semantic concept nodes get attached to their source file's AST anchor."""
+    ext = {
+        "nodes": [
+            # AST file/module anchor
+            {"id": "config_app", "label": "config/app.exs",
+             "file_type": "code", "source_file": "config/app.exs",
+             "source_location": "L1"},
+            # Semantic-only concept extracted from the same file — no edges, no source_location
+            {"id": "oauth_providers_config", "label": "OAuth Providers Config",
+             "file_type": "rationale", "source_file": "config/app.exs"},
+        ],
+        "edges": [],
+        "input_tokens": 0, "output_tokens": 0,
+    }
+    G = build_from_json(ext)
+    # The orphan concept should now connect to its file anchor via part_of.
+    assert G.has_edge("oauth_providers_config", "config_app")
+    edge_data = G.edges["oauth_providers_config", "config_app"]
+    assert edge_data["relation"] == "part_of"
+    assert edge_data["confidence"] == "INFERRED"
