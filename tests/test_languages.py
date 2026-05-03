@@ -578,6 +578,33 @@ def test_elixir_method_edges():
     assert len(methods) >= 3
 
 
+def test_elixir_extracts_absinthe_import_types():
+    """`import_types Mod` must produce `imports_types` edges per alias arg."""
+    r = extract_elixir(FIXTURES / "absinthe_schema.ex")
+    its = [e for e in r["edges"] if e["relation"] == "imports_types"]
+    # 1 single-arg + 2 from multi-arg = 3 module-import edges.
+    # `import_fields :atom` uses atoms (not aliases) and emits no edges.
+    assert len(its) == 3
+    labels = {e.get("target_label") for e in its}
+    assert "MyApp.GraphQL.UserSchema" in labels
+    assert "MyApp.GraphQL.OrderSchema" in labels
+    assert "MyApp.GraphQL.CartSchema" in labels
+
+
+def test_elixir_imports_types_resolves_to_module_nid():
+    """`extract()` resolver must rewrite imports_types target to real nid."""
+    from graphify.extract import extract
+    out = extract([FIXTURES / "absinthe_schema.ex"], cache_root=Path("/tmp"), parallel=False)
+    label_to_nid = {n["label"]: n["id"] for n in out["nodes"]}
+    its = [e for e in out["edges"] if e["relation"] == "imports_types"]
+    assert its
+    user_nid = label_to_nid.get("MyApp.GraphQL.UserSchema")
+    assert user_nid is not None
+    assert any(e["target"] == user_nid for e in its)
+    # target_label must be stripped after resolution
+    assert all("target_label" not in e for e in its)
+
+
 # ── Objective-C ──────────────────────────────────────────────────────────────
 from graphify.extract import extract_objc
 

@@ -45,6 +45,33 @@ def _rebuild_code(watch_path: Path, *, follow_symlinks: bool = False, force: boo
     watch_root = watch_path.resolve()
     project_root = Path.cwd().resolve() if not watch_path.is_absolute() else watch_root
     report_root = _report_root_label(watch_path)
+
+    # Multi-package safeguard. If `watch_path` has descendant `graphify-out/`
+    # dirs but none of its own, the user is likely scanning a workspace root
+    # (monorepo) where each package owns its own graph. Silently scanning the
+    # whole tree creates a stray top-level graphify-out/ that competes with
+    # per-package graphs (#bug: post-commit hook from worktree root).
+    own_out = (watch_path / "graphify-out" / "graph.json").exists()
+    if not own_out:
+        nested = [
+            p for p in watch_path.glob("*/graphify-out/graph.json")
+        ] + [
+            p for p in watch_path.glob("*/*/graphify-out/graph.json")
+        ]
+        # Exclude the one we'd create ourselves (none yet — own_out is False)
+        nested = [p for p in nested if p.parent.parent.resolve() != watch_root]
+        if nested:
+            relpaths = sorted({str(p.parent.parent.relative_to(watch_path)) for p in nested})
+            print(
+                f"[graphify watch] {watch_path} has {len(relpaths)} sub-packages with their own "
+                f"graphify-out/ ({', '.join(relpaths[:5])}{'…' if len(relpaths) > 5 else ''}). "
+                f"Refusing to create a top-level graph.json that would compete with them. "
+                f"Run `graphify update <subpackage>` per package, or build at workspace root "
+                f"by first removing the per-package graphify-out/ dirs.",
+                file=__import__('sys').stderr,
+            )
+            return False
+
     try:
         from graphify.extract import extract
         from graphify.detect import detect

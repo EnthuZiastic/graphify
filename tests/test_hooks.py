@@ -125,6 +125,16 @@ def test_hook_skips_head_on_exe():
     assert "*.exe) _SHEBANG=" in _PYTHON_DETECT or '*.exe)' in _PYTHON_DETECT
 
 
+def test_post_commit_hook_skips_when_no_graphify_out():
+    """post-commit hook script must early-exit when graphify-out/ is absent.
+    Without this guard the hook auto-creates a stray graphify-out/ at the
+    repo root in monorepos where per-package graphify-out/ dirs are canonical.
+    """
+    from graphify.hooks import _HOOK_SCRIPT
+    assert 'if [ ! -d "graphify-out" ]' in _HOOK_SCRIPT
+    assert "exit 0" in _HOOK_SCRIPT
+
+
 def test_hook_check_no_additionalContext(tmp_path):
     """graphify hook-check must not emit additionalContext — Codex Desktop rejects it."""
     import sys

@@ -59,6 +59,13 @@ if [ -z "$CHANGED" ]; then
     exit 0
 fi
 
+# Only run if graphify-out/ already exists in the repo root. Without this guard,
+# the hook auto-creates a stray graphify-out/ at the repo root in monorepos
+# where per-package graphify-out/ dirs are the canonical layout.
+if [ ! -d "graphify-out" ]; then
+    exit 0
+fi
+
 """ + _PYTHON_DETECT + """
 export GRAPHIFY_CHANGED="$CHANGED"
 

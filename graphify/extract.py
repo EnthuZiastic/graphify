@@ -3387,6 +3387,53 @@ def _resolve_cross_file_java_imports(
     return new_edges
 
 
+def _resolve_cross_file_elixir_imports(
+    nodes: list[dict],
+    edges: list[dict],
+    elixir_path_strs: set[str],
+) -> int:
+    """Resolve Elixir `imports` and `imports_types` edges to real module nids.
+
+    Each Elixir file emits import edges with `target_label` carrying the
+    dotted module name (e.g. `EnthuziasticWeb.GraphQL.Schema.AttendanceSchema`).
+    The temporary `target` is `_make_id(module_name)` which never matches the
+    real module nid `_make_id(stem, module_name)`. Without resolution every
+    Absinthe schema/type module looks orphaned in the graph.
+
+    Mutates `edges` in place: rewrites resolved targets to real nids and
+    strips the `target_label` field. Unresolved imports (stdlib/external like
+    `Ecto.Query`, `Phoenix.Controller`) keep their phantom target — `build.py`
+    drops them as dangling, which matches existing behavior.
+
+    Returns the count of resolved import edges.
+    """
+    label_to_nid: dict[str, str] = {}
+    for node in nodes:
+        sf = node.get("source_file", "")
+        label = node.get("label", "")
+        nid = node.get("id", "")
+        if not label or not nid or sf not in elixir_path_strs:
+            continue
+        # Module labels look like dotted aliases (e.g. "MyApp.Accounts.User").
+        # Skip file/function/test labels.
+        if label.endswith((")", ".ex", ".exs")):
+            continue
+        if not label[0].isalpha() or not label[0].isupper():
+            continue
+        label_to_nid.setdefault(label, nid)
+
+    resolved_count = 0
+    for e in edges:
+        tlabel = e.pop("target_label", None) if "target_label" in e else None
+        if e.get("relation") not in ("imports", "imports_types") or not tlabel:
+            continue
+        resolved = label_to_nid.get(tlabel)
+        if resolved is not None:
+            e["target"] = resolved
+            resolved_count += 1
+    return resolved_count
+
+
 def extract_objc(path: Path) -> dict:
     """Extract interfaces, implementations, protocols, methods, and imports from .m/.mm/.h files."""
     try:
@@ -3633,12 +3680,87 @@ def extract_elixir(path: Path) -> dict:
     add_node(file_nid, path.name, 1)
 
     _IMPORT_KEYWORDS = frozenset({"alias", "import", "require", "use"})
+    # Absinthe schema-composition macros — `import_types Mod` and
+    # `import_fields :name` aggregate type/field defs from another module into
+    # the current schema. Without modeling these, every Absinthe schema/type
+    # module looks orphaned (only edge: `contains` from its own file).
+    _ABSINTHE_IMPORT_KEYWORDS = frozenset({"import_types", "import_fields"})
 
     def _get_alias_text(node) -> str | None:
         for child in node.children:
             if child.type == "alias":
                 return source[child.start_byte:child.end_byte].decode("utf-8", errors="replace")
         return None
+
+    def _get_all_alias_texts(node) -> list[str]:
+        """Direct alias children — `import_types A, B, C` form."""
+        return [
+            source[c.start_byte:c.end_byte].decode("utf-8", errors="replace")
+            for c in node.children
+            if c.type == "alias"
+        ]
+
+    def _collect_alias_pairs(arguments_node) -> list[tuple[str, str]]:
+        """Parse an `alias` call's arguments. Returns [(short, full)] pairs.
+
+        Handles three forms:
+          alias Foo.Bar.Baz             → ("Baz", "Foo.Bar.Baz")
+          alias Foo.Bar.{Qux, Quux}     → ("Qux","Foo.Bar.Qux"), ("Quux","Foo.Bar.Quux")
+          alias My.Long.Mod, as: Short  → ("Short", "My.Long.Mod")
+        """
+        pairs: list[tuple[str, str]] = []
+        # Look for `alias :: Foo.Bar.{X, Y}` pattern (dot + tuple children)
+        dot_node = next((c for c in arguments_node.children if c.type == "dot"), None)
+        keywords_node = next((c for c in arguments_node.children if c.type == "keywords"), None)
+
+        if dot_node:
+            base_alias = next((c for c in dot_node.children if c.type == "alias"), None)
+            tuple_node = next((c for c in dot_node.children if c.type == "tuple"), None)
+            if base_alias and tuple_node:
+                base_text = source[base_alias.start_byte:base_alias.end_byte].decode("utf-8", errors="replace")
+                for c in tuple_node.children:
+                    if c.type == "alias":
+                        short = source[c.start_byte:c.end_byte].decode("utf-8", errors="replace")
+                        pairs.append((short, f"{base_text}.{short}"))
+                return pairs
+
+        # Single alias, optionally with `as: Short` keyword
+        primary_alias = next((c for c in arguments_node.children if c.type == "alias"), None)
+        if not primary_alias:
+            return pairs
+        full = source[primary_alias.start_byte:primary_alias.end_byte].decode("utf-8", errors="replace")
+        as_alias: str | None = None
+        if keywords_node:
+            for pair_node in keywords_node.children:
+                if pair_node.type != "pair":
+                    continue
+                kw = next((c for c in pair_node.children if c.type == "keyword"), None)
+                val = next((c for c in pair_node.children if c.type == "alias"), None)
+                if kw and val:
+                    kw_text = source[kw.start_byte:kw.end_byte].decode("utf-8", errors="replace").rstrip(": ").strip()
+                    if kw_text == "as":
+                        as_alias = source[val.start_byte:val.end_byte].decode("utf-8", errors="replace")
+        short = as_alias if as_alias else full.rsplit(".", 1)[-1]
+        pairs.append((short, full))
+        return pairs
+
+    def _expand_alias(module_name: str, amap: dict[str, str]) -> str:
+        """Apply alias expansion. Prefix-match supports `Schema.AuthSchema`
+        when only `Schema` is aliased to `EnthuziasticWeb.GraphQL.Schema`.
+        Loops up to 5 times so chained aliases like `alias EnthuziasticWeb.GraphQL`
+        + `alias GraphQL.Foo.Bar` resolve to `EnthuziasticWeb.GraphQL.Foo.Bar`.
+        """
+        for _ in range(5):
+            first, _, rest = module_name.partition(".")
+            if first not in amap or amap[first] == first:
+                return module_name
+            expanded = amap[first] if not rest else f"{amap[first]}.{rest}"
+            if expanded == module_name:
+                return module_name
+            module_name = expanded
+        return module_name
+
+    alias_map: dict[str, str] = {}
 
     def walk(node, parent_module_nid: str | None = None) -> None:
         if node.type != "call":
@@ -3672,6 +3794,12 @@ def extract_elixir(path: Path) -> dict:
             module_nid = _make_id(stem, module_name)
             add_node(module_nid, module_name, line)
             add_edge(file_nid, module_nid, "contains", line)
+            # Elixir auto-aliases the current module's last segment, so inside
+            # `defmodule EnthuziasticWeb.GraphQL.Schema do`, `Schema.AuthSchema`
+            # resolves to `EnthuziasticWeb.GraphQL.Schema.AuthSchema`. Mirror
+            # that by registering `last_segment → full_module_name`.
+            last_segment = module_name.rsplit(".", 1)[-1]
+            alias_map.setdefault(last_segment, module_name)
             if do_block_node:
                 for child in do_block_node.children:
                     walk(child, parent_module_nid=module_nid)
@@ -3703,10 +3831,34 @@ def extract_elixir(path: Path) -> dict:
             return
 
         if keyword in _IMPORT_KEYWORDS and arguments_node:
+            if keyword == "alias":
+                for short, full in _collect_alias_pairs(arguments_node):
+                    alias_map.setdefault(short, _expand_alias(full, alias_map))
             module_name = _get_alias_text(arguments_node)
             if module_name:
                 tgt_nid = _make_id(module_name)
-                add_edge(file_nid, tgt_nid, "imports", line, context="import")
+                edge = {
+                    "source": file_nid, "target": tgt_nid, "relation": "imports",
+                    "confidence": "EXTRACTED", "source_file": str_path,
+                    "source_location": f"L{line}", "weight": 1.0,
+                    "context": "import", "target_label": module_name,
+                }
+                edges.append(edge)
+            return
+
+        if keyword in _ABSINTHE_IMPORT_KEYWORDS and arguments_node:
+            module_names = _get_all_alias_texts(arguments_node)
+            src_nid = parent_module_nid or file_nid
+            for module_name in module_names:
+                resolved_name = _expand_alias(module_name, alias_map)
+                tgt_nid = _make_id(resolved_name)
+                edge = {
+                    "source": src_nid, "target": tgt_nid, "relation": "imports_types",
+                    "confidence": "EXTRACTED", "source_file": str_path,
+                    "source_location": f"L{line}", "weight": 1.0,
+                    "context": keyword, "target_label": resolved_name,
+                }
+                edges.append(edge)
             return
 
         for child in node.children:
@@ -3725,6 +3877,7 @@ def extract_elixir(path: Path) -> dict:
         "def", "defp", "defmodule", "defmacro", "defmacrop",
         "defstruct", "defprotocol", "defimpl", "defguard",
         "alias", "import", "require", "use",
+        "import_types", "import_fields",
         "if", "unless", "case", "cond", "with", "for",
     })
 
@@ -3778,7 +3931,7 @@ def extract_elixir(path: Path) -> dict:
         walk_calls(body, caller_nid)
 
     clean_edges = [e for e in edges if e["source"] in seen_ids and
-                   (e["target"] in seen_ids or e["relation"] == "imports")]
+                   (e["target"] in seen_ids or e["relation"] in ("imports", "imports_types"))]
     return {"nodes": nodes, "edges": clean_edges, "raw_calls": raw_calls, "input_tokens": 0, "output_tokens": 0}
 
 
@@ -4079,6 +4232,18 @@ def extract(
         except Exception as exc:
             import logging
             logging.getLogger(__name__).warning("Java cross-file import resolution failed, skipping: %s", exc)
+
+    # Cross-file Elixir import resolution. Rewrites `imports` / `imports_types`
+    # edge targets from `_make_id(module_name)` (phantom) to the real module
+    # nid `_make_id(stem, module_name)` by matching `target_label`.
+    elixir_paths = [p for p in paths if p.suffix in (".ex", ".exs")]
+    if elixir_paths:
+        elixir_path_strs = {str(p) for p in elixir_paths}
+        try:
+            _resolve_cross_file_elixir_imports(all_nodes, all_edges, elixir_path_strs)
+        except Exception as exc:
+            import logging
+            logging.getLogger(__name__).warning("Elixir cross-file import resolution failed, skipping: %s", exc)
 
     # Cross-file call resolution for all languages
     # Each extractor saved unresolved calls in raw_calls. Now that we have all
