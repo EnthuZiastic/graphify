@@ -250,7 +250,7 @@ Rules:
 
 Code files: focus on semantic edges AST cannot find (call relationships, shared data, arch patterns).
   Do not re-extract imports - AST already has those.
-Doc/paper files: extract named concepts, entities, citations. For rationale (WHY decisions were made, trade-offs, design intent): store as a `rationale` attribute on the relevant concept node — do NOT create a separate rationale node or fragment node. Only create a node for something that is itself a named entity or concept. Use `file_type:"rationale"` for concept-like nodes (ideas, principles, mechanisms, design patterns). Do NOT invent file_types like `concept` — valid values are only `code|document|paper|image|rationale`.
+Doc/paper files: extract named concepts, entities, citations. For rationale (WHY decisions were made, trade-offs, design intent): store as a `rationale` attribute on the relevant concept node — do NOT create a separate rationale node or fragment node. Only create a node for something that is itself a named entity or concept. Use `file_type:"rationale"` for concept-like nodes (ideas, principles, mechanisms, design patterns). Valid file_type values: `code|document|paper|image|rationale|concept`. Do NOT use `config` — use `code` instead.
 Code files: when adding `calls` edges, source MUST be the caller (the function/class doing the calling), target MUST be the callee. Never reverse this direction.
 Image files: use vision to understand what the image IS - do not just OCR.
   UI screenshot: layout patterns, design decisions, key elements, purpose.
@@ -435,7 +435,7 @@ questions = suggest_questions(G, communities, labels)
 
 report = generate(G, communities, cohesion, labels, gods, surprises, detection, tokens, 'INPUT_PATH', suggested_questions=questions)
 Path('graphify-out/GRAPH_REPORT.md').write_text(report)
-to_json(G, communities, 'graphify-out/graph.json')
+to_json(G, communities, 'graphify-out/graph.json', force=True)
 
 analysis = {
     'communities': {str(k): v for k, v in communities.items()},
@@ -860,7 +860,7 @@ labels = {cid: 'Community ' + str(cid) for cid in communities}
 
 report = generate(G, communities, cohesion, labels, gods, surprises, detection, tokens, '.')
 Path('graphify-out/GRAPH_REPORT.md').write_text(report)
-to_json(G, communities, 'graphify-out/graph.json')
+to_json(G, communities, 'graphify-out/graph.json', force=True)
 
 analysis = {
     'communities': {str(k): v for k, v in communities.items()},

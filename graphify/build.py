@@ -183,6 +183,20 @@ def _norm_label(label: str) -> str:
     return re.sub(r"[^a-z0-9 ]", "", label.lower()).strip()
 
 
+# Generic OTP/LiveView callback names that appear in every module.
+# Collapsing these across different source files creates fake god nodes
+# (e.g. all LiveView mount/2 callbacks merged into one "mount()" node
+# with degree = N_liveviews, distorting betweenness centrality).
+_GENERIC_LABELS: frozenset[str] = frozenset({
+    "mount", "mount2",
+    "handleevent", "handleinfo", "handleparams",
+    "handlecast", "handlecall", "handle",
+    "init", "terminate", "startlink",
+    "call", "cast", "info",
+    "render", "update",
+})
+
+
 def deduplicate_by_label(nodes: list[dict], edges: list[dict]) -> tuple[list[dict], list[dict]]:
     """Merge nodes that share a normalised label, rewriting edge references.
 
@@ -192,6 +206,10 @@ def deduplicate_by_label(nodes: list[dict], edges: list[dict]) -> tuple[list[dic
          converge even when their ID schemes differ.
       2. Prefer IDs without chunk suffixes (`_c\\d+`).
       3. Prefer the shorter ID.
+
+    Generic OTP/LiveView callback names (mount, handle_event, init, etc.) are
+    never collapsed across different source files — doing so creates fake god
+    nodes whose high betweenness reflects label collision, not real architecture.
 
     Drops self-loops created by the merge. Called from `build_from_json`.
     """
@@ -219,11 +237,20 @@ def deduplicate_by_label(nodes: list[dict], edges: list[dict]) -> tuple[list[dic
         existing = canonical.get(key)
         if existing is None:
             canonical[key] = node
-        elif _better(node, existing):
-            remap[existing["id"]] = node["id"]
-            canonical[key] = node
         else:
-            remap[node["id"]] = existing["id"]
+            # Never merge generic callback names across different source files.
+            node_src = node.get("source_file") or ""
+            existing_src = existing.get("source_file") or ""
+            if key in _GENERIC_LABELS and node_src and existing_src and node_src != existing_src:
+                # Treat as distinct: keep existing under this key, leave node as-is
+                # by storing it under a unique key so it survives dedup.
+                canonical[f"{key}__{node['id']}"] = node
+                continue
+            if _better(node, existing):
+                remap[existing["id"]] = node["id"]
+                canonical[key] = node
+            else:
+                remap[node["id"]] = existing["id"]
 
     if not remap:
         return nodes, edges
